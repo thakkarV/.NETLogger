@@ -1,9 +1,7 @@
 ﻿using System;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
+using System.Diagnostics;
 using System.IO;
-using System.Linq;
-using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -73,7 +71,7 @@ namespace NETLogger
         // set to private so that only one instance is created
         private Logger()
         {
-            this.verbosity = 3;
+            this.verbosity = 2;
             LogDispatcher.Instance.pushNewLog(new Log(
                 Log.LogType.Debug,
                 entryNumber++,
@@ -143,6 +141,8 @@ namespace NETLogger
     /// This allows the <see cref="Logger"/> to execute just a few lines of code and quickly return to the main execution thread.
     /// This preserves the responsiveness of the main application while still allowing accurately time stamped <see cref="Log"/>
     /// entries that are written in the exact even when multiple threads are accessing the logger at the same time.
+    /// Note that the dispatcher needs to  implement <see cref="IDisposable"/> interface as its member <see cref="BlockingCollection{Log}"/>
+    /// implements it as well.
     /// </remarks>
     internal class LogDispatcher : IDisposable
     {
@@ -154,7 +154,7 @@ namespace NETLogger
         /// <summary>
         /// File stream that the <see cref="LogDispatcher"/> writes to.
         /// </summary>
-        private readonly StreamWriter LogFile;
+        private readonly StreamWriter logFile;
 
         /// <summary>
         /// Loggers reprent a producer/consumer pattern and therefore 
@@ -165,12 +165,13 @@ namespace NETLogger
         private readonly BlockingCollection<Log> logQueue;
 
         /// <summary>
-        /// Background thread that manages the write operations of the <see cref="LogDispatcher"/>.
+        /// Task that is set to <see cref="TaskCreationOptions.PreferFairness"/> and <see cref="TaskCreationOptions.LongRunning"/> 
+        /// and runs the <see cref="logWriter"/> method that handles all the write operations.
         /// </summary>
-        private Thread loggingThread;
+        private Task taskWriter;
 
         /// <summary>
-        /// Signals the log writer to end logging when set to true, and calls the <see cref="LogDispatcher.Dispose()"/> as a result.
+        /// Signals the log writer to end logging when set to true.
         /// </summary>
         private bool terminate = false;
 
@@ -205,11 +206,11 @@ namespace NETLogger
                 }
             }
 
-            // now make logfile
+            // now make the log file
             try
             {
-                this.LogFile = File.CreateText(logPath + "\\LogFile.txt");
-                this.LogFile.AutoFlush = true;
+                this.logFile = File.CreateText(logPath + "\\LogFile.txt");
+                this.logFile.AutoFlush = true;
             }
             catch (Exception e)
             {
@@ -220,11 +221,8 @@ namespace NETLogger
             // make the blocking collection that stores all queued logs
             this.logQueue = new BlockingCollection<Log>();
 
-            // initialize writer loggingThread to run in the background
-            this.loggingThread = new Thread(logWriter);
-            this.loggingThread.IsBackground = false;
-            this.loggingThread.Start();
-            loggingThread.Join();
+            // Start new task on a seperate thread that handles the writer
+            this.taskWriter = Task.Factory.StartNew(() => logWriter(), TaskCreationOptions.LongRunning | TaskCreationOptions.PreferFairness);
         }
 
         /// <summary>
@@ -233,50 +231,39 @@ namespace NETLogger
         public void logWriter()
         {
             Log writingLog = new Log();
+            //Stopwatch s2 = new Stopwatch();
+            //s2.Start();
+            //Console.WriteLine("S2 start");
             while (!terminate && logQueue.Count != 0)
             {
-                /*
-                  waiting.Set();
-                  int i = ManualResetEvent.WaitAny(new WaitHandle[] { hasNewLogs, terminate });
-
-                  // check for termination signal
-                  if (i == 0) { return; }
-
-                  BlockingCollection<Log> copyLogQueue = new BlockingCollection<Log>();
-                  lock(logQueue)
-                  {
-                      copyLogQueue = logQueue;
-                  }
-
-                  hasNewLogs.Reset();
-                  waiting.Reset();
-              */
+                
                 if (this.logQueue.TryTake(out writingLog, -1))
                 {
                     switch(writingLog.lType)
                     {
                         case (Log.LogType.Debug) :
-                            LogFile.WriteLine(writingLog.entryNumber + " -- DEBUG -- " + writingLog.timeStamp);
-                            LogFile.WriteLine("\t" + writingLog.message);
+                            logFile.WriteLine(writingLog.entryNumber + " -- DEBUG -- " + writingLog.message + " -- " + writingLog.timeStamp);
                             break;
 
                         case (Log.LogType.Warning) :
-                            LogFile.WriteLine(writingLog.entryNumber + " -- WARNING -- " + writingLog.timeStamp);
-                            LogFile.WriteLine("\t" + writingLog.message);
+                            logFile.WriteLine(writingLog.entryNumber + " -- WARNING -- " + writingLog.message + " -- " + writingLog.timeStamp);
                             break;
 
                         case (Log.LogType.Exception) :
-                            LogFile.WriteLine(writingLog.entryNumber + " -- EXCEPTION -- " + writingLog.timeStamp);
-                            LogFile.WriteLine("\t ============== EXCEPTION INFORMATION FOLLOWS ============== ");
-                            LogFile.WriteLine("\t Log Message: " + writingLog.message);
-                            LogFile.WriteLine("\t Exception Message: " + writingLog.e.Message);
-                            LogFile.WriteLine("\t Exception Thread: " + writingLog.threadId);
-                            LogFile.WriteLine("\t Source: " + writingLog.e.ToString());
-                            LogFile.WriteLine("\t =============== END EXCEPTION INFORMATION ================== ");
+                            logFile.WriteLine(writingLog.entryNumber + " -- EXCEPTION -- " + writingLog.message + writingLog.timeStamp);
+                            logFile.WriteLine("\t ============== EXCEPTION INFORMATION FOLLOWS ============== ");
+                            logFile.WriteLine("\t Exception Message: " + writingLog.e.Message);
+                            logFile.WriteLine("\t Exception Thread: " + writingLog.threadId);
+                            logFile.WriteLine("\t Source: " + writingLog.e.ToString());
+                            logFile.WriteLine("\t =============== END EXCEPTION INFORMATION ================== ");
                             break;
                     }
                 }
             }
+            //s2.Stop();
+            //Console.WriteLine("S2 stop");
+            //Console.WriteLine("Log time elapsed in milliseconds : " + s2.ElapsedMilliseconds);
+            logFile.WriteLine(" =============== END OF LOG FILE. LOG DISPATCHER DISPOSED =============== ");
         }
 
         /// <summary>
@@ -304,24 +291,20 @@ namespace NETLogger
         /// <param name="disposing">True when called manually. False when called from the distructor by the <see cref="GC"/>.</param>
         protected virtual void Dispose(bool disposing)
         {
-            this.logQueue.Add(new Log(
-                Log.LogType.Debug,
-                -1,
-                "Terminating All Logging Procedures",
-                DateTime.Now.ToString("yyyy-mm-dd hh:mm:ss.fff")));
             this.logQueue.CompleteAdding();
             this.terminate = true;
-            this.loggingThread.Join();
+
+            // now free all resources
             if (disposing)
             {
                 if (logQueue != null)
                 {
                     logQueue.Dispose();
                 }
-                if (LogFile != null)
+                if (logFile != null)
                 {
-                    LogFile.Close();
-                    LogFile.Dispose();
+                    logFile.Close();
+                    logFile.Dispose();
                 }
             }
         }
@@ -366,7 +349,7 @@ namespace NETLogger
         /// Time at which the log entry write was requested.
         /// </summary>
         /// <remarks>
-        /// Request time may not be the same as the write time as the <see cref="LogDispatcher"/> writes to the LogFile in an asynchronous manner.
+        /// Request time may not be the same as the write time as the <see cref="LogDispatcher"/> writes to the logFile in an asynchronous manner.
         /// </remarks>
         internal string timeStamp { get; private set; }
 
